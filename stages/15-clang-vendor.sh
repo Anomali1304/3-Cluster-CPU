@@ -22,7 +22,39 @@ case "${CLANG_VENDOR:-GKI}" in
         log "CLANG_VENDOR=ZyC — resolving latest ZyCromerZ/Clang release..."
         check_cmd jq || error "jq not installed (see stages/00-deps.sh)."
 
-        # GitHub may return an error object instead of a release, so .assets can be null.\n        release_json="$(curl -fsSL --retry 3 --retry-delay 2 \\\n            -H 'Accept: application/vnd.github+json' \\\n            -H 'User-Agent: 3-Cluster-CPU-build' \\\n            https://api.github.com/repos/ZyCromerZ/Clang/releases/latest)" \\\n            || error "Unable to query ZyCromerZ/Clang Releases API."\n\n        api_message="$(printf '%s' "$release_json" | jq -r '.message // empty' 2>/dev/null || true)"\n        [ -z "$api_message" ] || error "ZyCromerZ/Clang Releases API: $api_message"\n\n        asset_url="$(printf '%s' "$release_json" \\\n            | jq -r '(.assets // [])[]?.browser_download_url // empty' \\\n            | grep -E 'Clang-.*\\.(tar\\.gz|tar\\.zst|tar\\.xz)$' \\\n            | sort -V | tail -1)"
+        # Prefer the Releases API, but keep a non-API fallback because GitHub can
+        # rate-limit unauthenticated API requests from Actions runners.
+        release_json=""
+        if release_json="$(curl -fsSL --retry 3 --retry-delay 2 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: 3-Cluster-CPU-build' \
+            https://api.github.com/repos/ZyCromerZ/Clang/releases/latest)"; then
+            api_message="$(printf '%s' "$release_json" | jq -r '.message // empty' 2>/dev/null || true)"
+            if [ -z "$api_message" ]; then
+                asset_url="$(printf '%s' "$release_json" \
+                    | jq -r '(.assets // [])[]?.browser_download_url // empty' \
+                    | grep -E 'Clang-.*\.(tar\.gz|tar\.zst|tar\.xz)$' \
+                    | sort -V | tail -1)"
+            else
+                warn "ZyC Releases API returned: $api_message — trying release-page fallback."
+            fi
+        else
+            warn "ZyC Releases API unavailable — trying release-page fallback."
+        fi
+
+        if [ -z "${asset_url:-}" ]; then
+            asset_url="$(curl -fsSL --retry 3 --retry-delay 2 \
+                -H 'User-Agent: 3-Cluster-CPU-build' \
+                https://github.com/ZyCromerZ/Clang/releases/latest \
+                | grep -oE 'https://github\.com/ZyCromerZ/Clang/releases/download/[^"< ]+/Clang-[^"< ]+\.(tar\.gz|tar\.zst|tar\.xz)' \
+                | head -1 || true)"
+        fi
+
+        # Last-resort pinned release known to publish a complete Clang tarball.
+        if [ -z "${asset_url:-}" ]; then
+            asset_url="https://github.com/ZyCromerZ/Clang/releases/download/23.0.0git-20260130-release/Clang-23.0.0git-20260130.tar.gz"
+            warn "Using pinned ZyC Clang fallback: $asset_url"
+        fi
         [ -n "$asset_url" ] || error "No matching Clang asset found in ZyCromerZ/Clang latest release."
         log "ZyC Clang asset: $asset_url"
 

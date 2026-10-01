@@ -538,6 +538,7 @@ MODULE_PARM_DESC(cpu_c3_rep_cpu, "Representative CPU for the virtual CPU7 A76 po
 
 static unsigned int cpu_c0_target_khz;
 static unsigned int cpu_c2_target_khz;
+static unsigned int cpu_c3_target_khz;
 
 /* CPU voltage follows frequency for idx0 when the target is above stock. */
 static unsigned int cpu_volt_follow        = 1;
@@ -564,7 +565,10 @@ module_param(cpu_c0_target_khz, uint, 0644);
 MODULE_PARM_DESC(cpu_c0_target_khz, "A55 CPU0-5 target max frequency KHz (0=stock)");
 
 module_param(cpu_c2_target_khz, uint, 0644);
-MODULE_PARM_DESC(cpu_c2_target_khz, "A76 CPU6/CPU7 target max frequency KHz (0=stock)");
+MODULE_PARM_DESC(cpu_c2_target_khz, "A76 CPU6 target max frequency KHz (0=stock)");
+
+module_param(cpu_c3_target_khz, uint, 0644);
+MODULE_PARM_DESC(cpu_c3_target_khz, "A76 CPU7 target max frequency KHz (0=stock)");
 
 static char cpu_oc_result[256] = "not applied yet";
 
@@ -836,9 +840,32 @@ out_put:
 	return ret;
 }
 
+static void set_logical_a76_max(unsigned int rep_cpu, unsigned int max_khz)
+{
+	struct cpufreq_policy *policy;
+
+	if (!max_khz)
+		return;
+
+	policy = cpufreq_cpu_get(rep_cpu);
+	if (!policy)
+		return;
+
+	down_write(&policy->rwsem);
+	if (max_khz > policy->cpuinfo.max_freq)
+		max_khz = policy->cpuinfo.max_freq;
+	policy->max = max_khz;
+	if (policy->min > policy->max)
+		policy->min = policy->max;
+	up_write(&policy->rwsem);
+
+	cpufreq_cpu_put(policy);
+}
+
 static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
 {
 	unsigned int trigger;
+	unsigned int a76_physical_target;
 	int ret0 = 0, ret2 = 0;
 
 	if (kstrtouint(val, 10, &trigger))
@@ -854,20 +881,45 @@ static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
 
 	mutex_lock(&oc_lock);
 
+	/*
+	 * CPU0-5 has its own physical LUT. CPU6/CPU7 are separate logical
+	 * policies but share one physical A76 LUT, so the physical LUT must
+	 * be large enough for the higher of the two requested targets.
+	 */
+	a76_physical_target = cpu_c2_target_khz;
+	if (cpu_c3_target_khz > a76_physical_target)
+		a76_physical_target = cpu_c3_target_khz;
+
 	if (cpu_c0_target_khz || g_c0_have_orig)
 		ret0 = patch_physical_idx0(cpu_c0_rep_cpu, cpu_c0_target_khz,
 					   &g_c0_orig_khz, &g_c0_orig_volt,
 					   &g_c0_have_orig);
 
-	if (!ret0 && (cpu_c2_target_khz || g_c2_have_orig))
-		ret2 = patch_physical_idx0(cpu_c2_rep_cpu, cpu_c2_target_khz,
+	if (!ret0 && (a76_physical_target || g_c2_have_orig))
+		ret2 = patch_physical_idx0(cpu_c2_rep_cpu, a76_physical_target,
 					   &g_c2_orig_khz, &g_c2_orig_volt,
 					   &g_c2_have_orig);
 
+	if (!ret0 && !ret2) {
+		/*
+		 * The shared physical LUT follows the higher A76 request, while
+		 * each Linux policy keeps its own logical max.
+		 */
+		if (g_c2_have_orig) {
+			unsigned int c2_max = cpu_c2_target_khz ?
+					      cpu_c2_target_khz : g_c2_orig_khz;
+			unsigned int c3_max = cpu_c3_target_khz ?
+					      cpu_c3_target_khz : g_c2_orig_khz;
+
+			set_logical_a76_max(cpu_c2_rep_cpu, c2_max);
+			set_logical_a76_max(cpu_c3_rep_cpu, c3_max);
+		}
+	}
+
 	if (ret0 == -ERANGE || ret2 == -ERANGE)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
-			 "FAIL: target exceeds safety cap (A55=%u A76=%u KHz)",
-			 cpu_c0_target_khz, cpu_c2_target_khz);
+			 "FAIL: target exceeds safety cap (A55=%u CPU6=%u CPU7=%u KHz)",
+			 cpu_c0_target_khz, cpu_c2_target_khz, cpu_c3_target_khz);
 	else if (ret0 == -EOVERFLOW || ret2 == -EOVERFLOW)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
 			 "FAIL: required LUT voltage raise exceeds cpu_volt_max_delta_raw=%u or absolute ceiling",
@@ -880,10 +932,11 @@ static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
 			 "FAIL: A55=%d A76=%d", ret0, ret2);
 	else
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
-			 "OK: A55=%u A76=%u KHz (stock %u/%u)",
+			 "OK: A55=%u CPU6=%u CPU7=%u KHz (A76 physical=%u)",
 			 cpu_c0_target_khz ? cpu_c0_target_khz : g_c0_orig_khz,
 			 cpu_c2_target_khz ? cpu_c2_target_khz : g_c2_orig_khz,
-			 g_c0_orig_khz, g_c2_orig_khz);
+			 cpu_c3_target_khz ? cpu_c3_target_khz : g_c2_orig_khz,
+			 a76_physical_target ? a76_physical_target : g_c2_orig_khz);
 
 	mutex_unlock(&oc_lock);
 	return 0;
@@ -901,7 +954,7 @@ static const struct kernel_param_ops cpu_oc_apply_ops = {
 
 module_param_cb(cpu_oc_apply, &cpu_oc_apply_ops, &cpu_oc_apply, 0644);
 MODULE_PARM_DESC(cpu_oc_apply,
-		 "Write 1 to apply A55 and A76 idx0 targets");
+		 "Write 1 to apply A55, CPU6 and CPU7 logical max targets");
 
 static int cpu_min_khz_set(unsigned int rep_cpu, unsigned int *requested,
 			   const char *val)
@@ -1053,7 +1106,7 @@ static int guardian_thread_fn(void *unused)
 				   g_c0_requested_min_khz);
 		guardian_check_one(cpu_c2_rep_cpu, cpu_c2_target_khz,
 				   g_c2_requested_min_khz);
-		guardian_check_one(cpu_c3_rep_cpu, cpu_c2_target_khz,
+		guardian_check_one(cpu_c3_rep_cpu, cpu_c3_target_khz,
 				   g_c3_requested_min_khz);
 		mutex_unlock(&oc_lock);
 		msleep_interruptible(GUARDIAN_POLL_MS);

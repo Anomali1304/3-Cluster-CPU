@@ -22,10 +22,7 @@ case "${CLANG_VENDOR:-GKI}" in
         log "CLANG_VENDOR=ZyC — resolving latest ZyCromerZ/Clang release..."
         check_cmd jq || error "jq not installed (see stages/00-deps.sh)."
 
-        asset_url="$(curl -s https://api.github.com/repos/ZyCromerZ/Clang/releases/latest \
-            | jq -r '.assets[].browser_download_url' \
-            | grep -E 'Clang-.*\.(tar\.gz|tar\.zst|tar\.xz)' \
-            | sort -V | tail -1)"
+        # GitHub may return an error object instead of a release, so .assets can be null.\n        release_json="$(curl -fsSL --retry 3 --retry-delay 2 \\\n            -H 'Accept: application/vnd.github+json' \\\n            -H 'User-Agent: 3-Cluster-CPU-build' \\\n            https://api.github.com/repos/ZyCromerZ/Clang/releases/latest)" \\\n            || error "Unable to query ZyCromerZ/Clang Releases API."\n\n        api_message="$(printf '%s' "$release_json" | jq -r '.message // empty' 2>/dev/null || true)"\n        [ -z "$api_message" ] || error "ZyCromerZ/Clang Releases API: $api_message"\n\n        asset_url="$(printf '%s' "$release_json" \\\n            | jq -r '(.assets // [])[]?.browser_download_url // empty' \\\n            | grep -E 'Clang-.*\\.(tar\\.gz|tar\\.zst|tar\\.xz)$' \\\n            | sort -V | tail -1)"
         [ -n "$asset_url" ] || error "No matching Clang asset found in ZyCromerZ/Clang latest release."
         log "ZyC Clang asset: $asset_url"
 

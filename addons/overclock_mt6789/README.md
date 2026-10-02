@@ -129,4 +129,10 @@ The voltage slope is derived from the same physical domain's stock LUT rows 1 an
 
 **Important:** `LUT_VOLT = bits[28:12]` is based on correlation with `/proc/eem_lite/eem_cur_volt`, not an official MediaTek register definition. This implementation therefore treats it as a hardware-LUT voltage candidate, not proof that the PMIC/MCUPM rail has been independently commanded. Validate readback and actual EEM/voltage behavior on-device before relying on it.
 
+### EEM/SVS voltage rewrite and re-assert
+
+EEM/SVS (`/proc/eem_lite`) keeps its own table (stock frequency and stock voltages) and periodically rewrites the voltage field of the LUT rows. On a tested MT6789 the OC frequency stayed in the LUT, but the raised idx0 voltage was rewritten back to the stock value (A55 86250, A76 77500) some time after the apply, so a one-time write is not enough.
+
+`cpu_volt_reassert=1` (default) makes the guardian check the idx0 voltage every ~0.5 s and, when it differs from what was written, re-apply the OC through the normal quiesce + write path (at most once per 5 s per domain). `cpu_lut_dump` shows `re-applied Nx` per domain, and `dmesg | grep oc_mt6789` logs each re-apply. A re-apply briefly caps the domain below idx0 for a few milliseconds. Set `cpu_volt_reassert=0` to disable it.
+
 `cpu_lut_dump` lists **physical** domains only: `cpu0` (A55, CPU0-5) and `cpu6` (A76). CPU7 is a virtual policy over the same A76 hardware domain and LUT, so it is intentionally not listed separately; the A76 block prints its request slots instead. After an OC apply, each block also shows `idx0 volt: written by module=X, LUT now=Y`. `HELD` means nothing rewrote the field; `CHANGED` means EEM/SVS (`/proc/eem_lite`) overwrote the voltage after the write, so the raised voltage is not what the hardware keeps using. Compare with `cat /proc/eem_lite/eem_cur_volt`.

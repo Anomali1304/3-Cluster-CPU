@@ -616,7 +616,7 @@ static bool g_c0_have_orig;
 static bool g_c2_have_orig;
 
 #define QUIESCE_POLL_US     500U
-#define QUIESCE_TIMEOUT_US  50000U
+#define QUIESCE_TIMEOUT_US  250000U
 
 static struct cpufreq_policy *get_a76_sibling(struct cpufreq_policy *c2_policy)
 {
@@ -637,11 +637,40 @@ static struct cpufreq_policy *get_a76_sibling(struct cpufreq_policy *c2_policy)
 	return sib;
 }
 
+/* Details of the last quiesce timeout, reported through cpu_oc_result. */
+static unsigned int g_quiesce_cpu;
+static unsigned int g_quiesce_state;
+
+/*
+ * Actively move one logical policy off idx0.
+ *
+ * The cpufreq driver only writes REG_FREQ_PERF_STATE when cpufreq actually
+ * requests a new frequency. With schedutil + fast switch, a lowered max (our
+ * QoS request) is only noticed on the next scheduler update of that policy,
+ * so an idle CPU6/CPU7 never leaves idx0 by itself. On the shared A76 domain
+ * the register holds min(request CPU6, request CPU7), so BOTH logical
+ * policies must have dropped their request.
+ *
+ * The QoS notifier applies the new limits asynchronously via policy->update,
+ * so flush that first; otherwise the target below would still be clamped to
+ * the old policy->max.
+ */
+static void push_policy_off_idx0(struct cpufreq_policy *p)
+{
+	if (!p || !p->freq_table)
+		return;
+
+	flush_work(&p->update);
+	cpufreq_driver_target(p, p->freq_table[1].frequency, CPUFREQ_RELATION_H);
+}
+
 static int quiesce_off_idx0(struct cpufreq_policy *policy,
+			     struct cpufreq_policy *sib,
 			     struct cpufreq_mtk_mirror *c,
 			     struct freq_qos_request *qos_req)
 {
 	unsigned int waited_us = 0;
+	unsigned int state;
 	int ret;
 
 	if (!c || c->nr_opp < 2)
@@ -652,6 +681,9 @@ static int quiesce_off_idx0(struct cpufreq_policy *policy,
 	if (ret < 0)
 		return ret;
 
+	push_policy_off_idx0(policy);
+	push_policy_off_idx0(sib);
+
 	while (waited_us < QUIESCE_TIMEOUT_US) {
 		if (readl_relaxed(c->reg_bases[REG_FREQ_PERF_STATE]) != 0)
 			return 0;
@@ -659,6 +691,12 @@ static int quiesce_off_idx0(struct cpufreq_policy *policy,
 		usleep_range(QUIESCE_POLL_US, QUIESCE_POLL_US * 2);
 		waited_us += QUIESCE_POLL_US;
 	}
+
+	state = readl_relaxed(c->reg_bases[REG_FREQ_PERF_STATE]);
+	g_quiesce_cpu = cpumask_first(policy->related_cpus);
+	g_quiesce_state = state;
+	pr_err("oc_mt6789: cpu%u: PERF_STATE still %u after %u us, policy max=%u cur=%u\n",
+	       g_quiesce_cpu, state, waited_us, policy->max, policy->cur);
 
 	freq_qos_remove_request(qos_req);
 	return -ETIMEDOUT;
@@ -805,7 +843,7 @@ static int patch_physical_idx0(unsigned int rep_cpu, unsigned int target_khz,
 		sib_qos_held = true;
 	}
 
-	ret = quiesce_off_idx0(policy, hw, &qos_req);
+	ret = quiesce_off_idx0(policy, sib, hw, &qos_req);
 	if (ret)
 		goto out;
 
@@ -956,7 +994,8 @@ static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
 			 cpu_volt_max_delta_raw, cpu_volt_abs_max());
 	else if (ret0 == -ETIMEDOUT || ret2 == -ETIMEDOUT)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
-			 "FAIL: physical domain did not leave idx0 in time");
+			 "FAIL: domain of cpu%u stuck at PERF_STATE=%u, did not leave idx0 (see dmesg oc_mt6789)",
+			 g_quiesce_cpu, g_quiesce_state);
 	else if (ret0 || ret2)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
 			 "FAIL: A55=%d A76=%d", ret0, ret2);
@@ -1358,4 +1397,4 @@ module_exit(oc_mt6789_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Anomali1304");
 MODULE_DESCRIPTION("6+1+1 CPU + GPU control for MT6789 Helio G99 — POCO M5 rock");
-MODULE_VERSION("2.2.1-6P1P1");
+MODULE_VERSION("2.2.2-6P1P1");

@@ -98,8 +98,8 @@ The 6+1+1 CPU path can optionally raise the voltage field in the same hardware L
 
 Parameters:
 - `cpu_volt_follow=1`: enable frequency-following LUT voltage calculation.
-- `cpu_volt_max_delta_raw=12500`: maximum increase over stock idx0 voltage (raw, mV*100; 12500 = +125 mV). Runtime tunable.
-- `cpu_volt_abs_max_raw=110000`: ceiling for the final idx0 LUT voltage (110000 = 1.10 V). Runtime tunable, but always clamped to a compile-time hard maximum of `115000` raw (1.15 V) that no parameter can lift.
+- `cpu_volt_max_delta_raw=20000`: maximum increase over stock idx0 voltage (raw, mV*100; 20000 = +200 mV). Runtime tunable.
+- `cpu_volt_abs_max_raw=112000`: ceiling for the final idx0 LUT voltage (112000 = 1.12 V). Runtime tunable, but always clamped to a compile-time hard maximum of `115000` raw (1.15 V) that no parameter can lift.
 
 Raw unit is 10 uV, so 625 raw = one 6.25 mV EEM step and 100 raw = 1 mV.
 
@@ -107,7 +107,7 @@ The old defaults (`3000` / `102000`) refused most useful OC targets, because a f
 
 If a target still needs more voltage than the limits allow, the apply is refused (never silently under-volted) and `cpu_oc_result` reports the real numbers, for example:
 
-    FAIL: cpu0 needs +13750 raw volt (top 108750 raw); limits delta=12500 abs=110000. ...
+    FAIL: cpu0 needs +13750 raw volt (top 108750 raw); limits delta=20000 abs=112000. ...
 
 Raise the matching parameter at runtime (no rebuild) or lower the target:
 
@@ -115,6 +115,15 @@ Raise the matching parameter at runtime (no rebuild) or lower the target:
     echo 112000 > /sys/module/overclock_mt6789/parameters/cpu_volt_abs_max_raw
 
 Higher voltage means more heat and faster silicon wear. Raise limits only as far as a target actually needs.
+
+### Explicit voltage per domain
+
+The automatic voltage comes from a linear slope over the stock LUT rows 1 and 3. It can be a poor model at the top of the curve (on MT6789 the stock A76 rows 0 and 1 share one voltage, which makes the slope very shallow). Set the final idx0 voltage yourself with:
+
+    echo 90000 > /sys/module/overclock_mt6789/parameters/cpu_c2_volt_raw   # A76 (CPU6/CPU7)
+    echo 95000 > /sys/module/overclock_mt6789/parameters/cpu_c0_volt_raw   # A55 (CPU0-5)
+
+`0` (default) keeps the automatic value. The value is rounded up to the 625-raw step, is never lower than stock idx0, still has to fit `cpu_volt_max_delta_raw` and `cpu_volt_abs_max_raw`, and takes effect on the next OC apply. The numbers above are only examples of the syntax, not validated settings; raise voltage in small steps and verify stability yourself.
 
 The voltage slope is derived from the same physical domain's stock LUT rows 1 and 3, then rounded upward to the 625-raw EEM step. The write preserves all other bits in the LUT row and changes only `LUT_FREQ` and `LUT_VOLT`.
 

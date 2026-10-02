@@ -637,6 +637,50 @@ static struct cpufreq_policy *get_a76_sibling(struct cpufreq_policy *c2_policy)
 	return sib;
 }
 
+/*
+ * Repair for a bug in the 6+1+1 cpufreq-hw patch.
+ *
+ * The driver writes PERF_STATE = min(requested_idx[0], requested_idx[1]).
+ * Slot [1] belongs to the virtual CPU7 policy, which only exists in the A76
+ * domain. The A55 domain has no virtual policy, but policy init still fills
+ * slot [1] with the boot-time index and nothing ever updates it again. If that
+ * value is 0 the register is always written as 0: the A55 domain is pinned at
+ * idx0 (maximum frequency) and can never leave it, so quiesce times out.
+ *
+ * Make the unused slot neutral (UINT_MAX) and re-sync the register with the
+ * governor's last request. Safe to call repeatedly.
+ */
+static void neutralize_unused_request_slot(unsigned int rep_cpu)
+{
+	struct cpufreq_policy *policy;
+	struct cpufreq_mtk_mirror *c, *hw;
+	unsigned long flags;
+	unsigned int idx;
+
+	policy = cpufreq_cpu_get(rep_cpu);
+	if (!policy)
+		return;
+
+	c = (struct cpufreq_mtk_mirror *)policy->driver_data;
+	if (!c || c->virtual_policy)
+		goto out;
+
+	hw = (c->shared && c->shared != c) ? c->shared : c;
+
+	spin_lock_irqsave(&hw->lock, flags);
+	if (hw->requested_idx[1] != UINT_MAX) {
+		pr_info("oc_mt6789: cpu%u: unused request slot was %u, set neutral (A55 was pinned to min(req, slot))\n",
+			rep_cpu, hw->requested_idx[1]);
+		hw->requested_idx[1] = UINT_MAX;
+		idx = hw->requested_idx[0];
+		if (idx < (unsigned int)hw->nr_opp)
+			writel_relaxed(idx, hw->reg_bases[REG_FREQ_PERF_STATE]);
+	}
+	spin_unlock_irqrestore(&hw->lock, flags);
+out:
+	cpufreq_cpu_put(policy);
+}
+
 /* Details of the last quiesce timeout, reported through cpu_oc_result. */
 static unsigned int g_quiesce_cpu;
 static unsigned int g_quiesce_state;
@@ -756,6 +800,9 @@ static int patch_physical_idx0(unsigned int rep_cpu, unsigned int target_khz,
 		cpufreq_cpu_put(policy);
 		return -EINVAL;
 	}
+
+	if (rep_cpu == cpu_c0_rep_cpu)
+		neutralize_unused_request_slot(rep_cpu);
 
 	if (!*have_orig) {
 		*orig_khz = hw->table[0].frequency;
@@ -1274,6 +1321,8 @@ static int __init oc_mt6789_init(void)
 		cpu_volt_follow, cpu_volt_max_delta_raw, cpu_volt_abs_max(),
 		CPU_VOLT_ABS_HARD_MAX_RAW);
 
+	neutralize_unused_request_slot(cpu_c0_rep_cpu);
+
 	ret = register_pm_notifier(&oc_mt6789_pm_nb);
 	if (ret)
 		pr_warn("oc_mt6789: register_pm_notifier failed (%d) — suspend guard inactive\n", ret);
@@ -1397,4 +1446,4 @@ module_exit(oc_mt6789_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Anomali1304");
 MODULE_DESCRIPTION("6+1+1 CPU + GPU control for MT6789 Helio G99 — POCO M5 rock");
-MODULE_VERSION("2.2.2-6P1P1");
+MODULE_VERSION("2.2.3-6P1P1");

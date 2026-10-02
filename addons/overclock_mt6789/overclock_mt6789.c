@@ -1033,8 +1033,16 @@ static void set_logical_a76_max(unsigned int rep_cpu, unsigned int max_khz)
 	cpufreq_cpu_put(policy);
 }
 
-/* Apply the current CPU OC targets. Caller must hold oc_lock. */
-static void cpu_oc_apply_locked(void)
+#define OC_DOM_A55 0x1U
+#define OC_DOM_A76 0x2U
+#define OC_DOM_ALL (OC_DOM_A55 | OC_DOM_A76)
+
+/*
+ * Apply the current CPU OC targets for the domains in mask. Caller must hold
+ * oc_lock. The guardian re-applies only the domain whose voltage drifted, so
+ * the other domain is not quiesced for nothing.
+ */
+static void cpu_oc_apply_locked(unsigned int mask)
 {
 	unsigned int a76_physical_target;
 	int ret0 = 0, ret2 = 0;
@@ -1048,17 +1056,18 @@ static void cpu_oc_apply_locked(void)
 	if (cpu_c3_target_khz > a76_physical_target)
 		a76_physical_target = cpu_c3_target_khz;
 
-	if (cpu_c0_target_khz || g_c0_have_orig)
+	if ((mask & OC_DOM_A55) && (cpu_c0_target_khz || g_c0_have_orig))
 		ret0 = patch_physical_idx0(cpu_c0_rep_cpu, cpu_c0_target_khz,
 					   &g_c0_orig_khz, &g_c0_orig_volt,
 					   &g_c0_have_orig);
 
-	if (!ret0 && (a76_physical_target || g_c2_have_orig))
+	if (!ret0 && (mask & OC_DOM_A76) &&
+	    (a76_physical_target || g_c2_have_orig))
 		ret2 = patch_physical_idx0(cpu_c2_rep_cpu, a76_physical_target,
 					   &g_c2_orig_khz, &g_c2_orig_volt,
 					   &g_c2_have_orig);
 
-	if (!ret0 && !ret2) {
+	if (!ret0 && !ret2 && (mask & OC_DOM_A76)) {
 		/*
 		 * The shared physical LUT follows the higher A76 request, while
 		 * each Linux policy keeps its own logical max.
@@ -1116,7 +1125,7 @@ static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
 	}
 
 	mutex_lock(&oc_lock);
-	cpu_oc_apply_locked();
+	cpu_oc_apply_locked(OC_DOM_ALL);
 	mutex_unlock(&oc_lock);
 	return 0;
 }
@@ -1302,7 +1311,7 @@ static bool lut_idx0_volt(unsigned int rep_cpu, unsigned int *volt)
 static void guardian_reassert_volt(void)
 {
 	unsigned int a76_target = max(cpu_c2_target_khz, cpu_c3_target_khz);
-	bool need = false;
+	unsigned int mask = 0;
 	int dom;
 
 	if (!cpu_volt_reassert || atomic_read(&oc_mt6789_suspended))
@@ -1328,11 +1337,11 @@ static void guardian_reassert_volt(void)
 		pr_info("oc_mt6789: %s idx0 voltage rewritten %u -> %u raw (EEM/SVS?), re-applying (#%u)\n",
 			dom ? "A76" : "A55", g_applied_volt[dom], now,
 			g_reassert_count[dom]);
-		need = true;
+		mask |= dom ? OC_DOM_A76 : OC_DOM_A55;
 	}
 
-	if (need)
-		cpu_oc_apply_locked();
+	if (mask)
+		cpu_oc_apply_locked(mask);
 }
 
 static int guardian_thread_fn(void *unused)
@@ -1596,4 +1605,4 @@ module_exit(oc_mt6789_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Anomali1304");
 MODULE_DESCRIPTION("6+1+1 CPU + GPU control for MT6789 Helio G99 — POCO M5 rock");
-MODULE_VERSION("2.2.7-6P1P1");
+MODULE_VERSION("2.2.8-6P1P1");

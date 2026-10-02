@@ -484,7 +484,16 @@ MODULE_PARM_DESC(gpu_oc_apply, "Write 1 to apply gpu_target_freq/volt/vsram to O
  * treated as an official MediaTek register definition. The write preserves
  * all other LUT bits and only changes bits[28:12].
  */
-#define CPU_VOLT_ABS_MAX_RAW  102000U
+/*
+ * Raw LUT voltage unit is 10 uV (625 raw = one 6.25 mV EEM step).
+ *
+ * cpu_volt_abs_max_raw (runtime tunable) is the ceiling for the final idx0
+ * LUT voltage. It can never exceed CPU_VOLT_ABS_HARD_MAX_RAW, which is a
+ * compile-time limit that no module parameter can lift.
+ */
+#define CPU_VOLT_ABS_DEFAULT_RAW  110000U  /* 1.10 V */
+#define CPU_VOLT_ABS_HARD_MAX_RAW 115000U  /* 1.15 V */
+#define CPU_VOLT_DELTA_DEFAULT_RAW 12500U  /* +125 mV = 20 EEM steps */
 #define EEM_VOLT_STEP         625U
 
 enum {
@@ -542,7 +551,8 @@ static unsigned int cpu_c3_target_khz;
 
 /* CPU voltage follows frequency for idx0 when the target is above stock. */
 static unsigned int cpu_volt_follow        = 1;
-static unsigned int cpu_volt_max_delta_raw = 3000;
+static unsigned int cpu_volt_max_delta_raw = CPU_VOLT_DELTA_DEFAULT_RAW;
+static unsigned int cpu_volt_abs_max_raw   = CPU_VOLT_ABS_DEFAULT_RAW;
 
 module_param(cpu_volt_follow, uint, 0644);
 MODULE_PARM_DESC(cpu_volt_follow,
@@ -550,7 +560,23 @@ MODULE_PARM_DESC(cpu_volt_follow,
 
 module_param(cpu_volt_max_delta_raw, uint, 0644);
 MODULE_PARM_DESC(cpu_volt_max_delta_raw,
-		 "Maximum LUT voltage raise over stock idx0, raw (mV*100)");
+		 "Maximum LUT voltage raise over stock idx0, raw (mV*100), default 12500 = +125mV");
+
+module_param(cpu_volt_abs_max_raw, uint, 0644);
+MODULE_PARM_DESC(cpu_volt_abs_max_raw,
+		 "Ceiling for final idx0 LUT voltage, raw (mV*100), default 110000 = 1.10V, hard max 115000");
+
+/* Effective absolute ceiling: the tunable value clamped to the hard limit. */
+static unsigned int cpu_volt_abs_max(void)
+{
+	return min_t(unsigned int, cpu_volt_abs_max_raw,
+		     CPU_VOLT_ABS_HARD_MAX_RAW);
+}
+
+/* Details of the last voltage refusal, reported through cpu_oc_result. */
+static unsigned int g_volt_refuse_cpu;
+static unsigned int g_volt_refuse_need;
+static unsigned int g_volt_refuse_top;
 
 static unsigned int g_c0_orig_volt;
 static unsigned int g_c2_orig_volt;
@@ -745,10 +771,13 @@ static int patch_physical_idx0(unsigned int rep_cpu, unsigned int target_khz,
 		}
 
 		if (dv > (s64)cpu_volt_max_delta_raw ||
-		    (s64)*orig_volt + dv > (s64)CPU_VOLT_ABS_MAX_RAW) {
-			pr_err("oc_mt6789: cpu%u: voltage raise +%lld raw exceeds limit %u or abs max %u; refused\n",
-			       rep_cpu, dv, cpu_volt_max_delta_raw,
-			       CPU_VOLT_ABS_MAX_RAW);
+		    (s64)*orig_volt + dv > (s64)cpu_volt_abs_max()) {
+			pr_err("oc_mt6789: cpu%u: voltage raise +%lld raw (top %lld raw) exceeds delta limit %u or abs max %u; refused\n",
+			       rep_cpu, dv, (s64)*orig_volt + dv,
+			       cpu_volt_max_delta_raw, cpu_volt_abs_max());
+			g_volt_refuse_cpu  = rep_cpu;
+			g_volt_refuse_need = (unsigned int)dv;
+			g_volt_refuse_top  = (unsigned int)((s64)*orig_volt + dv);
 			if (*have_orig)
 				*have_orig = false;
 			cpufreq_cpu_put(policy);
@@ -922,8 +951,9 @@ static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
 			 cpu_c0_target_khz, cpu_c2_target_khz, cpu_c3_target_khz);
 	else if (ret0 == -EOVERFLOW || ret2 == -EOVERFLOW)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
-			 "FAIL: required LUT voltage raise exceeds cpu_volt_max_delta_raw=%u or absolute ceiling",
-			 cpu_volt_max_delta_raw);
+			 "FAIL: cpu%u needs +%u raw volt (top %u raw); limits delta=%u abs=%u. Raise cpu_volt_max_delta_raw / cpu_volt_abs_max_raw or lower the target",
+			 g_volt_refuse_cpu, g_volt_refuse_need, g_volt_refuse_top,
+			 cpu_volt_max_delta_raw, cpu_volt_abs_max());
 	else if (ret0 == -ETIMEDOUT || ret2 == -ETIMEDOUT)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
 			 "FAIL: physical domain did not leave idx0 in time");
@@ -1201,8 +1231,9 @@ static int __init oc_mt6789_init(void)
 	pr_info("overclock_mt6789: init (GPU working_table patch + CPU cpufreq-hw LUT patch)\n");
 	pr_info("oc_mt6789: 6+1+1 CPU control safety cap = stock +%d%%, %uMHz absolute ceiling\n",
 		MAX_OC_PERCENT_OVER_STOCK, MAX_OC_ABSOLUTE_KHZ / 1000);
-	pr_info("oc_mt6789: CPU LUT voltage follow=%u, max raise=%u raw, abs max=%u raw\n",
-		cpu_volt_follow, cpu_volt_max_delta_raw, CPU_VOLT_ABS_MAX_RAW);
+	pr_info("oc_mt6789: CPU LUT voltage follow=%u, max raise=%u raw, abs max=%u raw (hard max %u)\n",
+		cpu_volt_follow, cpu_volt_max_delta_raw, cpu_volt_abs_max(),
+		CPU_VOLT_ABS_HARD_MAX_RAW);
 
 	ret = register_pm_notifier(&oc_mt6789_pm_nb);
 	if (ret)
@@ -1327,4 +1358,4 @@ module_exit(oc_mt6789_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Anomali1304");
 MODULE_DESCRIPTION("6+1+1 CPU + GPU control for MT6789 Helio G99 — POCO M5 rock");
-MODULE_VERSION("2.2.0-6P1P1");
+MODULE_VERSION("2.2.1-6P1P1");

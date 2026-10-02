@@ -708,6 +708,23 @@ out:
 static unsigned int g_applied_volt[2];
 static bool g_applied_volt_valid[2];
 
+/*
+ * EEM/SVS (eem_lite) periodically rewrites the voltage field of the LUT rows
+ * from its own table, which still holds the stock idx0 voltage. When that
+ * happens the OC frequency stays but the raised voltage is lost. With
+ * cpu_volt_reassert=1 the guardian notices the drift and re-applies the OC
+ * (same quiesce + write path as a normal apply), at most once per
+ * VOLT_REASSERT_MIN_MS per domain.
+ */
+#define VOLT_REASSERT_MIN_MS 5000U
+static unsigned int cpu_volt_reassert = 1;
+static unsigned long g_reassert_last[2];
+static unsigned int g_reassert_count[2];
+
+module_param(cpu_volt_reassert, uint, 0644);
+MODULE_PARM_DESC(cpu_volt_reassert,
+		 "1 = re-apply the idx0 LUT voltage when EEM/SVS rewrites it (default), 0 = off");
+
 /* Details of the last quiesce timeout, reported through cpu_oc_result. */
 static unsigned int g_quiesce_cpu;
 static unsigned int g_quiesce_state;
@@ -1016,24 +1033,11 @@ static void set_logical_a76_max(unsigned int rep_cpu, unsigned int max_khz)
 	cpufreq_cpu_put(policy);
 }
 
-static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
+/* Apply the current CPU OC targets. Caller must hold oc_lock. */
+static void cpu_oc_apply_locked(void)
 {
-	unsigned int trigger;
 	unsigned int a76_physical_target;
 	int ret0 = 0, ret2 = 0;
-
-	if (kstrtouint(val, 10, &trigger))
-		return -EINVAL;
-	if (trigger != 1)
-		return 0;
-
-	if (atomic_read(&oc_mt6789_suspended)) {
-		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
-			 "FAIL: device suspending, refused");
-		return 0;
-	}
-
-	mutex_lock(&oc_lock);
 
 	/*
 	 * CPU0-5 has its own physical LUT. CPU6/CPU7 are separate logical
@@ -1094,6 +1098,25 @@ static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
 			 cpu_c3_target_khz ? cpu_c3_target_khz : g_c2_orig_khz,
 			 a76_physical_target ? a76_physical_target : g_c2_orig_khz);
 
+}
+
+static int cpu_oc_apply_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int trigger;
+
+	if (kstrtouint(val, 10, &trigger))
+		return -EINVAL;
+	if (trigger != 1)
+		return 0;
+
+	if (atomic_read(&oc_mt6789_suspended)) {
+		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
+			 "FAIL: device suspending, refused");
+		return 0;
+	}
+
+	mutex_lock(&oc_lock);
+	cpu_oc_apply_locked();
 	mutex_unlock(&oc_lock);
 	return 0;
 }
@@ -1254,8 +1277,68 @@ static void guardian_check_one(unsigned int rep_cpu, unsigned int target_khz,
 	cpufreq_cpu_put(policy);
 }
 
+/* Current idx0 LUT voltage of the physical domain behind rep_cpu. */
+static bool lut_idx0_volt(unsigned int rep_cpu, unsigned int *volt)
+{
+	struct cpufreq_policy *policy = cpufreq_cpu_get(rep_cpu);
+	struct cpufreq_mtk_mirror *c, *hw;
+	bool ok = false;
+
+	if (!policy)
+		return false;
+
+	c = (struct cpufreq_mtk_mirror *)policy->driver_data;
+	if (c) {
+		hw = (c->shared && c->shared != c) ? c->shared : c;
+		*volt = FIELD_GET(LUT_VOLT,
+				  readl_relaxed(hw->reg_bases[REG_FREQ_LUT_TABLE]));
+		ok = true;
+	}
+	cpufreq_cpu_put(policy);
+	return ok;
+}
+
+/* Caller holds oc_lock. Re-apply the OC if EEM/SVS rewrote an idx0 voltage. */
+static void guardian_reassert_volt(void)
+{
+	unsigned int a76_target = max(cpu_c2_target_khz, cpu_c3_target_khz);
+	bool need = false;
+	int dom;
+
+	if (!cpu_volt_reassert || atomic_read(&oc_mt6789_suspended))
+		return;
+
+	for (dom = 0; dom < 2; dom++) {
+		unsigned int rep = dom ? cpu_c2_rep_cpu : cpu_c0_rep_cpu;
+		unsigned int tgt = dom ? a76_target : cpu_c0_target_khz;
+		unsigned int orig = dom ? g_c2_orig_khz : g_c0_orig_khz;
+		bool have = dom ? g_c2_have_orig : g_c0_have_orig;
+		unsigned int now;
+
+		if (!tgt || !have || tgt <= orig || !g_applied_volt_valid[dom])
+			continue;
+		if (!lut_idx0_volt(rep, &now) || now == g_applied_volt[dom])
+			continue;
+		if (time_before(jiffies, g_reassert_last[dom] +
+				msecs_to_jiffies(VOLT_REASSERT_MIN_MS)))
+			continue;
+
+		g_reassert_last[dom] = jiffies;
+		g_reassert_count[dom]++;
+		pr_info("oc_mt6789: %s idx0 voltage rewritten %u -> %u raw (EEM/SVS?), re-applying (#%u)\n",
+			dom ? "A76" : "A55", g_applied_volt[dom], now,
+			g_reassert_count[dom]);
+		need = true;
+	}
+
+	if (need)
+		cpu_oc_apply_locked();
+}
+
 static int guardian_thread_fn(void *unused)
 {
+	unsigned int tick = 0;
+
 	while (!kthread_should_stop()) {
 		mutex_lock(&oc_lock);
 		guardian_check_one(cpu_c0_rep_cpu, cpu_c0_target_khz,
@@ -1264,6 +1347,8 @@ static int guardian_thread_fn(void *unused)
 				   g_c2_requested_min_khz);
 		guardian_check_one(cpu_c3_rep_cpu, cpu_c3_target_khz,
 				   g_c3_requested_min_khz);
+		if ((++tick % 10) == 0)
+			guardian_reassert_volt();
 		mutex_unlock(&oc_lock);
 		msleep_interruptible(GUARDIAN_POLL_MS);
 	}
@@ -1342,10 +1427,11 @@ static void dump_one_cpu(int cpu, char *buf, size_t *off, size_t bufsize,
 
 		if (g_applied_volt_valid[dom])
 			*off += scnprintf(buf + *off, bufsize - *off,
-				"idx0 volt: written by module=%u, LUT now=%u -> %s\n",
+				"idx0 volt: written by module=%u, LUT now=%u -> %s | re-applied %ux\n",
 				g_applied_volt[dom], now_volt,
 				now_volt == g_applied_volt[dom] ? "HELD" :
-				"CHANGED after write (EEM/SVS rewrote it?)");
+				"CHANGED after write (EEM/SVS rewrote it?)",
+				g_reassert_count[dom]);
 		else
 			*off += scnprintf(buf + *off, bufsize - *off,
 				"idx0 volt: no OC applied yet, LUT now=%u\n", now_volt);
@@ -1510,4 +1596,4 @@ module_exit(oc_mt6789_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Anomali1304");
 MODULE_DESCRIPTION("6+1+1 CPU + GPU control for MT6789 Helio G99 — POCO M5 rock");
-MODULE_VERSION("2.2.6-6P1P1");
+MODULE_VERSION("2.2.7-6P1P1");

@@ -491,9 +491,9 @@ MODULE_PARM_DESC(gpu_oc_apply, "Write 1 to apply gpu_target_freq/volt/vsram to O
  * LUT voltage. It can never exceed CPU_VOLT_ABS_HARD_MAX_RAW, which is a
  * compile-time limit that no module parameter can lift.
  */
-#define CPU_VOLT_ABS_DEFAULT_RAW  110000U  /* 1.10 V */
+#define CPU_VOLT_ABS_DEFAULT_RAW  112000U  /* 1.12 V */
 #define CPU_VOLT_ABS_HARD_MAX_RAW 115000U  /* 1.15 V */
-#define CPU_VOLT_DELTA_DEFAULT_RAW 12500U  /* +125 mV = 20 EEM steps */
+#define CPU_VOLT_DELTA_DEFAULT_RAW 20000U  /* +200 mV = 32 EEM steps */
 #define EEM_VOLT_STEP         625U
 
 enum {
@@ -560,11 +560,30 @@ MODULE_PARM_DESC(cpu_volt_follow,
 
 module_param(cpu_volt_max_delta_raw, uint, 0644);
 MODULE_PARM_DESC(cpu_volt_max_delta_raw,
-		 "Maximum LUT voltage raise over stock idx0, raw (mV*100), default 12500 = +125mV");
+		 "Maximum LUT voltage raise over stock idx0, raw (mV*100), default 20000 = +200mV");
 
 module_param(cpu_volt_abs_max_raw, uint, 0644);
 MODULE_PARM_DESC(cpu_volt_abs_max_raw,
-		 "Ceiling for final idx0 LUT voltage, raw (mV*100), default 110000 = 1.10V, hard max 115000");
+		 "Ceiling for final idx0 LUT voltage, raw (mV*100), default 112000 = 1.12V, hard max 115000");
+
+/*
+ * Explicit idx0 LUT voltage per physical domain, raw (mV*100). 0 = derive it
+ * from the stock LUT slope (default). A non-zero value replaces the slope
+ * result for that domain: c0 = A55 (CPU0-5), c2 = A76 (shared by CPU6/CPU7).
+ * It is rounded up to the 625-raw EEM step, never goes below stock idx0, and
+ * is still checked against cpu_volt_max_delta_raw and cpu_volt_abs_max_raw.
+ * It takes effect on the next OC apply.
+ */
+static unsigned int cpu_c0_volt_raw;
+static unsigned int cpu_c2_volt_raw;
+
+module_param(cpu_c0_volt_raw, uint, 0644);
+MODULE_PARM_DESC(cpu_c0_volt_raw,
+		 "Explicit idx0 LUT voltage for the A55 domain, raw (mV*100); 0 = auto from LUT slope");
+
+module_param(cpu_c2_volt_raw, uint, 0644);
+MODULE_PARM_DESC(cpu_c2_volt_raw,
+		 "Explicit idx0 LUT voltage for the A76 domain (CPU6/CPU7), raw (mV*100); 0 = auto from LUT slope");
 
 /* Effective absolute ceiling: the tunable value clamped to the hard limit. */
 static unsigned int cpu_volt_abs_max(void)
@@ -787,6 +806,7 @@ static int patch_physical_idx0(unsigned int rep_cpu, unsigned int target_khz,
 	struct freq_qos_request sib_qos;
 	unsigned int use_khz, cap_khz, old_max, sib_old_max;
 	unsigned int new_volt = 0;
+	unsigned int ovr;
 	s64 dv = 0;
 	bool sib_qos_held = false;
 	u32 raw;
@@ -838,8 +858,17 @@ static int patch_physical_idx0(unsigned int rep_cpu, unsigned int target_khz,
 	 * Round upward to the EEM step so frequency increases never under-volt.
 	 * No hardware write occurs until all checks pass.
 	 */
-	if (cpu_volt_follow && use_khz > *orig_khz) {
-		if (hw->nr_opp >= 4) {
+	ovr = (rep_cpu == cpu_c0_rep_cpu) ? cpu_c0_volt_raw : cpu_c2_volt_raw;
+
+	if ((cpu_volt_follow || ovr) && use_khz > *orig_khz) {
+		if (ovr) {
+			unsigned int want = DIV_ROUND_UP(ovr, EEM_VOLT_STEP) *
+					    EEM_VOLT_STEP;
+
+			dv = want > *orig_volt ? (s64)(want - *orig_volt) : 0;
+			pr_info("oc_mt6789: cpu%u: explicit idx0 voltage %u raw requested (stock %u raw, raise +%lld)\n",
+				rep_cpu, want, *orig_volt, dv);
+		} else if (hw->nr_opp >= 4) {
 			u32 r1 = readl_relaxed(hw->reg_bases[REG_FREQ_LUT_TABLE] +
 					       1 * LUT_ROW_SIZE);
 			u32 r3 = readl_relaxed(hw->reg_bases[REG_FREQ_LUT_TABLE] +
@@ -1481,4 +1510,4 @@ module_exit(oc_mt6789_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Anomali1304");
 MODULE_DESCRIPTION("6+1+1 CPU + GPU control for MT6789 Helio G99 — POCO M5 rock");
-MODULE_VERSION("2.2.4-6P1P1");
+MODULE_VERSION("2.2.6-6P1P1");

@@ -681,6 +681,14 @@ out:
 	cpufreq_cpu_put(policy);
 }
 
+/*
+ * idx0 LUT voltage this module last wrote, per physical domain (0 = A55,
+ * 1 = A76). cpu_lut_dump compares it with what the LUT holds now, which shows
+ * whether EEM/SVS (eem_lite) rewrote the voltage field afterwards.
+ */
+static unsigned int g_applied_volt[2];
+static bool g_applied_volt_valid[2];
+
 /* Details of the last quiesce timeout, reported through cpu_oc_result. */
 static unsigned int g_quiesce_cpu;
 static unsigned int g_quiesce_state;
@@ -900,6 +908,9 @@ static int patch_physical_idx0(unsigned int rep_cpu, unsigned int target_khz,
 	      FIELD_PREP(LUT_FREQ, use_khz / 1000) |
 	      FIELD_PREP(LUT_VOLT, new_volt);
 	writel_relaxed(raw, hw->reg_bases[REG_FREQ_LUT_TABLE]);
+
+	g_applied_volt[rep_cpu == cpu_c0_rep_cpu ? 0 : 1] = new_volt;
+	g_applied_volt_valid[rep_cpu == cpu_c0_rep_cpu ? 0 : 1] = true;
 
 	hw->table[0].frequency = use_khz;
 
@@ -1283,8 +1294,32 @@ static void dump_one_cpu(int cpu, char *buf, size_t *off, size_t bufsize,
 			"[%2d]%s %10u KHz  %10u KHz   %8u   %s\n",
 			i, mark, sw_freq, hw_freq, lut_volt, match);
 
-		if (*off >= bufsize - 128)
-			return;
+		if (*off >= bufsize - 256)
+			break;
+	}
+
+	{
+		int dom = (cpu == (int)cpu_c0_rep_cpu) ? 0 : 1;
+		struct cpufreq_mtk_mirror *hw =
+			(c->shared && c->shared != c) ? c->shared : c;
+		u32 raw0 = readl_relaxed(c->reg_bases[REG_FREQ_LUT_TABLE]);
+		unsigned int now_volt = FIELD_GET(LUT_VOLT, raw0);
+
+		*off += scnprintf(buf + *off, bufsize - *off,
+			"logical policies: %s | request slots [%u,%u]\n",
+			dom ? "cpu6 + cpu7 (virtual, shares this LUT)" :
+			      "cpu0-5 (single policy, slot[1] unused)",
+			hw->requested_idx[0], hw->requested_idx[1]);
+
+		if (g_applied_volt_valid[dom])
+			*off += scnprintf(buf + *off, bufsize - *off,
+				"idx0 volt: written by module=%u, LUT now=%u -> %s\n",
+				g_applied_volt[dom], now_volt,
+				now_volt == g_applied_volt[dom] ? "HELD" :
+				"CHANGED after write (EEM/SVS rewrote it?)");
+		else
+			*off += scnprintf(buf + *off, bufsize - *off,
+				"idx0 volt: no OC applied yet, LUT now=%u\n", now_volt);
 	}
 
 	cpufreq_cpu_put(policy);
@@ -1446,4 +1481,4 @@ module_exit(oc_mt6789_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Anomali1304");
 MODULE_DESCRIPTION("6+1+1 CPU + GPU control for MT6789 Helio G99 — POCO M5 rock");
-MODULE_VERSION("2.2.3-6P1P1");
+MODULE_VERSION("2.2.4-6P1P1");

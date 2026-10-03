@@ -131,8 +131,10 @@ The voltage slope is derived from the same physical domain's stock LUT rows 1 an
 
 ### EEM/SVS voltage rewrite and re-assert
 
-EEM/SVS (`/proc/eem_lite`) keeps its own table (stock frequency and stock voltages) and periodically rewrites the voltage field of the LUT rows. On a tested MT6789 the OC frequency stayed in the LUT, but the raised idx0 voltage was rewritten back to the stock value (A55 86250, A76 77500) some time after the apply, so a one-time write is not enough.
+EEM/SVS (`/proc/eem_lite`) keeps its own table (stock frequency and stock voltages) and rewrites the voltage field of the LUT rows. On a tested MT6789 the OC frequency stayed in the LUT, but the raised idx0 voltage was rewritten back to stock (A55 86250, A76 77500), so a one-time write is not enough.
 
-`cpu_volt_reassert=1` (default) makes the guardian check the idx0 voltage every ~0.5 s and, when it differs from what was written, re-apply the OC through the normal quiesce + write path (at most once per 5 s per domain). `cpu_lut_dump` shows `re-applied Nx` per domain, and `dmesg | grep oc_mt6789` logs each re-apply. A re-apply briefly caps the domain below idx0 for a few milliseconds. Set `cpu_volt_reassert=0` to disable it.
+Measured on the same device: on the A55 domain the regulator follows the LUT voltage (`vproc11`: 0.84 V with LUT 86250, 1.00 V with LUT 101250). On the A76 domain the idx0 LUT voltage had no effect on `vproc12` (about 0.76 V for LUT 80000 and 95000), so A76 OC there is effectively frequency-only at stock voltage.
+
+`cpu_volt_reassert=1` (default) makes the guardian compare the idx0 voltage with what the module wrote every 50 ms and, on a mismatch, rewrite only the voltage field of that LUT word (no quiesce, frequency bits untouched; EEM updates the same word live). `cpu_lut_dump` shows `voltage restored Nx` per domain and `dmesg | grep oc_mt6789` logs it (rate limited). Set `cpu_volt_reassert=0` to disable.
 
 `cpu_lut_dump` lists **physical** domains only: `cpu0` (A55, CPU0-5) and `cpu6` (A76). CPU7 is a virtual policy over the same A76 hardware domain and LUT, so it is intentionally not listed separately; the A76 block prints its request slots instead. After an OC apply, each block also shows `idx0 volt: written by module=X, LUT now=Y`. `HELD` means nothing rewrote the field; `CHANGED` means EEM/SVS (`/proc/eem_lite`) overwrote the voltage after the write, so the raised voltage is not what the hardware keeps using. Compare with `cat /proc/eem_lite/eem_cur_volt`.

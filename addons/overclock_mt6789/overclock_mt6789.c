@@ -543,7 +543,13 @@ MODULE_PARM_DESC(cpu_c2_rep_cpu, "Representative CPU for the physical A76 policy
 MODULE_PARM_DESC(cpu_c3_rep_cpu, "Representative CPU for the virtual CPU7 A76 policy");
 
 #define MAX_OC_PERCENT_OVER_STOCK  60
-#define MAX_OC_ABSOLUTE_KHZ       2600000U
+#define MAX_OC_ABSOLUTE_KHZ       2600000U  /* default ceiling */
+/*
+ * cpu_oc_ceiling_khz (runtime tunable) is the absolute OC ceiling. It starts
+ * at MAX_OC_ABSOLUTE_KHZ so nothing changes unless it is raised on purpose,
+ * and it is always clamped to this compile-time hard maximum.
+ */
+#define MAX_OC_HARD_CEILING_KHZ   3000000U
 
 static unsigned int cpu_c0_target_khz;
 static unsigned int cpu_c2_target_khz;
@@ -584,6 +590,17 @@ MODULE_PARM_DESC(cpu_c0_volt_raw,
 module_param(cpu_c2_volt_raw, uint, 0644);
 MODULE_PARM_DESC(cpu_c2_volt_raw,
 		 "Explicit idx0 LUT voltage for the A76 domain (CPU6/CPU7), raw (mV*100); 0 = auto from LUT slope");
+
+static unsigned int cpu_oc_ceiling_khz = MAX_OC_ABSOLUTE_KHZ;
+
+module_param(cpu_oc_ceiling_khz, uint, 0644);
+MODULE_PARM_DESC(cpu_oc_ceiling_khz,
+		 "Absolute CPU OC ceiling in KHz, default 2600000, clamped to hard max 3000000");
+
+static unsigned int cpu_oc_ceiling(void)
+{
+	return min_t(unsigned int, cpu_oc_ceiling_khz, MAX_OC_HARD_CEILING_KHZ);
+}
 
 /* Effective absolute ceiling: the tunable value clamped to the hard limit. */
 static unsigned int cpu_volt_abs_max(void)
@@ -864,8 +881,8 @@ static int patch_physical_idx0(unsigned int rep_cpu, unsigned int target_khz,
 	else {
 		cap_khz = *orig_khz +
 			  (*orig_khz * MAX_OC_PERCENT_OVER_STOCK) / 100;
-		if (cap_khz > MAX_OC_ABSOLUTE_KHZ)
-			cap_khz = MAX_OC_ABSOLUTE_KHZ;
+		if (cap_khz > cpu_oc_ceiling())
+			cap_khz = cpu_oc_ceiling();
 		if (target_khz > cap_khz) {
 			cpufreq_cpu_put(policy);
 			return -ERANGE;
@@ -1088,8 +1105,9 @@ static void cpu_oc_apply_locked(unsigned int mask)
 
 	if (ret0 == -ERANGE || ret2 == -ERANGE)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
-			 "FAIL: target exceeds safety cap (A55=%u CPU6=%u CPU7=%u KHz)",
-			 cpu_c0_target_khz, cpu_c2_target_khz, cpu_c3_target_khz);
+			 "FAIL: target exceeds safety cap (A55=%u CPU6=%u CPU7=%u KHz, ceiling=%u KHz, max stock+%d%%)",
+			 cpu_c0_target_khz, cpu_c2_target_khz, cpu_c3_target_khz,
+			 cpu_oc_ceiling(), MAX_OC_PERCENT_OVER_STOCK);
 	else if (ret0 == -EOVERFLOW || ret2 == -EOVERFLOW)
 		snprintf(cpu_oc_result, sizeof(cpu_oc_result),
 			 "FAIL: cpu%u needs +%u raw volt (top %u raw); limits delta=%u abs=%u. Raise cpu_volt_max_delta_raw / cpu_volt_abs_max_raw or lower the target",
@@ -1483,8 +1501,9 @@ static int __init oc_mt6789_init(void)
 	int ret;
 
 	pr_info("overclock_mt6789: init (GPU working_table patch + CPU cpufreq-hw LUT patch)\n");
-	pr_info("oc_mt6789: 6+1+1 CPU control safety cap = stock +%d%%, %uMHz absolute ceiling\n",
-		MAX_OC_PERCENT_OVER_STOCK, MAX_OC_ABSOLUTE_KHZ / 1000);
+	pr_info("oc_mt6789: 6+1+1 CPU control safety cap = stock +%d%%, %uMHz ceiling (hard max %uMHz)\n",
+		MAX_OC_PERCENT_OVER_STOCK, cpu_oc_ceiling() / 1000,
+		MAX_OC_HARD_CEILING_KHZ / 1000);
 	pr_info("oc_mt6789: CPU LUT voltage follow=%u, max raise=%u raw, abs max=%u raw (hard max %u)\n",
 		cpu_volt_follow, cpu_volt_max_delta_raw, cpu_volt_abs_max(),
 		CPU_VOLT_ABS_HARD_MAX_RAW);
@@ -1614,4 +1633,4 @@ module_exit(oc_mt6789_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Anomali1304");
 MODULE_DESCRIPTION("6+1+1 CPU + GPU control for MT6789 Helio G99 — POCO M5 rock");
-MODULE_VERSION("2.2.9-6P1P1");
+MODULE_VERSION("2.3.0-6P1P1");

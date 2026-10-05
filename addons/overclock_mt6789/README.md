@@ -116,6 +116,14 @@ Raise the matching parameter at runtime (no rebuild) or lower the target:
 
 Higher voltage means more heat and faster silicon wear. Raise limits only as far as a target actually needs.
 
+### Stepping above the default ceiling
+
+By default targets are limited to stock +60% and to 2600 MHz. The 2600 MHz limit is `cpu_oc_ceiling_khz` (default 2600000). To search for the real limit of a given chip, raise it deliberately and step up in small increments:
+
+    echo 2700000 > /sys/module/overclock_mt6789/parameters/cpu_oc_ceiling_khz
+
+It is clamped to a compile-time hard maximum of 3000000 KHz. The WebUI reads it and extends its sliders. Reports from other MT6789 devices say targets above roughly 2600 MHz freeze under load; treat everything above the default as an experiment (expect hangs and forced reboots) and test each step before going further. A reboot returns the module to the default ceiling, and `service.sh` does not re-apply any target at boot.
+
 ### Explicit voltage per domain
 
 The automatic voltage comes from a linear slope over the stock LUT rows 1 and 3. It can be a poor model at the top of the curve (on MT6789 the stock A76 rows 0 and 1 share one voltage, which makes the slope very shallow). Set the final idx0 voltage yourself with:
